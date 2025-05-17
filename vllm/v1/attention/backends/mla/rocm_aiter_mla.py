@@ -67,13 +67,13 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         max_model_len = self.runner.model_config.max_model_len
         assert max_model_len == 32768,\
             "AITER MLA requires max_model_len=32768"
-        assert self.runner.block_size == 1, "AITER MLA" \
+        assert self.kv_cache_spec.block_size == 1, "AITER MLA" \
             "only supports block size 1."
 
     def _get_paged_kv_tensors(
             self, block_table: torch.Tensor,
             seq_lens: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        page_size = self.runner.block_size
+        page_size = self.kv_cache_spec.block_size
         block_table_bounds = (seq_lens + page_size - 1) // page_size
 
         mask = (torch.arange(block_table.size(1),
@@ -98,17 +98,17 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             paged_kv_last_page_len,
         )
 
-    def _build_decode(self, block_table: torch.Tensor,
+    def _build_decode(self, block_table_tensor: torch.Tensor,
                       seq_lens: torch.Tensor) -> AiterMLADecodeMetadata:
 
         (
             paged_kv_indices,
             paged_kv_indptr,
             paged_last_page_len,
-        ) = self._get_paged_kv_tensors(block_table, seq_lens)
+        ) = self._get_paged_kv_tensors(block_table_tensor, seq_lens)
 
         attn_metadata = AiterMLADecodeMetadata(
-            block_table=block_table,
+            block_table=block_table_tensor,
             seq_lens=seq_lens,
             paged_kv_indptr=paged_kv_indptr,
             paged_kv_indices=paged_kv_indices,
