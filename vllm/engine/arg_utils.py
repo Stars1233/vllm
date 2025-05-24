@@ -4,7 +4,7 @@
 import argparse
 import dataclasses
 import json
-import re
+import sys
 import threading
 import warnings
 from dataclasses import MISSING, dataclass, fields, is_dataclass
@@ -12,6 +12,7 @@ from itertools import permutations
 from typing import (Annotated, Any, Callable, Dict, List, Literal, Optional,
                     Type, TypeVar, Union, cast, get_args, get_origin)
 
+import regex as re
 import torch
 from typing_extensions import TypeIs, deprecated
 
@@ -36,8 +37,8 @@ from vllm.reasoning import ReasoningParserManager
 from vllm.test_utils import MODEL_WEIGHTS_S3_BUCKET, MODELS_ON_S3
 from vllm.transformers_utils.utils import check_gguf_file
 from vllm.usage.usage_lib import UsageContext
-from vllm.utils import (FlexibleArgumentParser, GiB_bytes, is_in_doc_build,
-                        is_in_ray_actor)
+from vllm.utils import (STR_DUAL_CHUNK_FLASH_ATTN_VAL, FlexibleArgumentParser,
+                        GiB_bytes, is_in_doc_build, is_in_ray_actor)
 
 # yapf: enable
 
@@ -182,7 +183,11 @@ def get_kwargs(cls: ConfigType) -> dict[str, Any]:
         kwargs[name] = {"default": default, "help": help}
 
         # Set other kwargs based on the type hints
-        json_tip = "\n\nShould be a valid JSON string."
+        json_tip = """\n\nShould either be a valid JSON string or JSON keys
+        passed individually. For example, the following sets of arguments are
+        equivalent:\n\n
+        - `--json-arg '{"key1": "value1", "key2": {"key3": "value2"}}'`\n
+        - `--json-arg.key1 value1 --json-arg.key2.key3 value2`\n\n"""
         if dataclass_cls is not None:
             dataclass_init = lambda x, f=dataclass_cls: f(**json.loads(x))
             # Special case for configs with a from_cli method
@@ -282,6 +287,9 @@ class EngineArgs:
     pipeline_parallel_size: int = ParallelConfig.pipeline_parallel_size
     tensor_parallel_size: int = ParallelConfig.tensor_parallel_size
     data_parallel_size: int = ParallelConfig.data_parallel_size
+    data_parallel_size_local: Optional[int] = None
+    data_parallel_address: Optional[str] = None
+    data_parallel_rpc_port: Optional[int] = None
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     max_parallel_loading_workers: Optional[
         int] = ParallelConfig.max_parallel_loading_workers
@@ -440,7 +448,8 @@ class EngineArgs:
             title="ModelConfig",
             description=ModelConfig.__doc__,
         )
-        model_group.add_argument("--model", **model_kwargs["model"])
+        if 'serve' not in sys.argv[1:] and '--help' not in sys.argv[1:]:
+            model_group.add_argument("--model", **model_kwargs["model"])
         model_group.add_argument("--task", **model_kwargs["task"])
         model_group.add_argument("--tokenizer", **model_kwargs["tokenizer"])
         model_group.add_argument("--tokenizer-mode",
@@ -568,7 +577,7 @@ class EngineArgs:
             action=argparse.BooleanOptionalAction,
             deprecated=True,
             help="[DEPRECATED] The `--enable-reasoning` flag is deprecated as "
-            "of v0.8.6. Use `--reasoning-parser` to specify the reasoning "
+            "of v0.9.0. Use `--reasoning-parser` to specify the reasoning "
             "parser backend instead. This flag (`--enable-reasoning`) will be "
             "removed in v0.10.0. When `--reasoning-parser` is specified, "
             "reasoning mode is automatically enabled.")
@@ -594,6 +603,21 @@ class EngineArgs:
                                     **parallel_kwargs["tensor_parallel_size"])
         parallel_group.add_argument("--data-parallel-size", "-dp",
                                     **parallel_kwargs["data_parallel_size"])
+        parallel_group.add_argument('--data-parallel-size-local',
+                                    '-dpl',
+                                    type=int,
+                                    help='Number of data parallel replicas '
+                                    'to run on this node.')
+        parallel_group.add_argument('--data-parallel-address',
+                                    '-dpa',
+                                    type=str,
+                                    help='Address of data parallel cluster '
+                                    'head-node.')
+        parallel_group.add_argument('--data-parallel-rpc-port',
+                                    '-dpp',
+                                    type=int,
+                                    help='Port for data parallel RPC '
+                                    'communication.')
         parallel_group.add_argument(
             "--enable-expert-parallel",
             **parallel_kwargs["enable_expert_parallel"])
@@ -713,7 +737,9 @@ class EngineArgs:
             title="DeviceConfig",
             description=DeviceConfig.__doc__,
         )
-        device_group.add_argument("--device", **device_kwargs["device"])
+        device_group.add_argument("--device",
+                                  **device_kwargs["device"],
+                                  deprecated=True)
 
         # Speculative arguments
         speculative_group = parser.add_argument_group(
@@ -953,7 +979,7 @@ class EngineArgs:
         from vllm.platforms import current_platform
         current_platform.pre_register_and_update()
 
-        device_config = DeviceConfig(device=self.device)
+        device_config = DeviceConfig(device=current_platform.device_type)
         model_config = self.create_model_config()
 
         # * If VLLM_USE_V1 is unset, we enable V1 for "supported features"
@@ -981,6 +1007,17 @@ class EngineArgs:
 
         assert self.enable_chunked_prefill is not None
 
+        if envs.VLLM_ATTENTION_BACKEND in [STR_DUAL_CHUNK_FLASH_ATTN_VAL]:
+            assert self.enforce_eager, (
+                "Cuda graph is not supported with DualChunkFlashAttention. "
+                "To run the model in eager mode, set 'enforce_eager=True' "
+                "or use '--enforce-eager' in the CLI.")
+            assert current_platform.is_cuda(), (
+                "DualChunkFlashAttention is only supported on CUDA platform.")
+            assert not use_v1, (
+                "DualChunkFlashAttention is not supported on V1 engine. "
+                "To run the model in V0 engine, try set 'VLLM_USE_V1=0'")
+
         cache_config = CacheConfig(
             block_size=self.block_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -1006,10 +1043,30 @@ class EngineArgs:
             # but we should not do this here.
             placement_group = ray.util.get_current_placement_group()
 
+        # Local DP size defaults to global DP size if not set.
+        data_parallel_size_local = self.data_parallel_size if (
+            self.data_parallel_size_local
+            is None) else self.data_parallel_size_local
+
+        # DP address, used in multi-node case for torch distributed group
+        # and ZMQ sockets.
+        data_parallel_address = self.data_parallel_address if (
+            self.data_parallel_address
+            is not None) else ParallelConfig.data_parallel_master_ip
+
+        # This port is only used when there are remote data parallel engines,
+        # otherwise the local IPC transport is used.
+        data_parallel_rpc_port = self.data_parallel_rpc_port if (
+            self.data_parallel_rpc_port
+            is not None) else ParallelConfig.data_parallel_rpc_port
+
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,
             tensor_parallel_size=self.tensor_parallel_size,
             data_parallel_size=self.data_parallel_size,
+            data_parallel_size_local=data_parallel_size_local,
+            data_parallel_master_ip=data_parallel_address,
+            data_parallel_rpc_port=data_parallel_rpc_port,
             enable_expert_parallel=self.enable_expert_parallel,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
             disable_custom_all_reduce=self.disable_custom_all_reduce,
@@ -1027,7 +1084,7 @@ class EngineArgs:
             disable_log_stats=self.disable_log_stats,
         )
 
-        # Reminder: Please update docs/source/features/compatibility_matrix.md
+        # Reminder: Please update docs/features/compatibility_matrix.md
         # If the feature combo become valid
         if self.num_scheduler_steps > 1:
             if speculative_config is not None:
@@ -1138,8 +1195,7 @@ class EngineArgs:
         #############################################################
         # Unsupported Feature Flags on V1.
 
-        if (self.load_format == LoadFormat.TENSORIZER.value
-                or self.load_format == LoadFormat.SHARDED_STATE.value):
+        if self.load_format == LoadFormat.SHARDED_STATE.value:
             _raise_or_fallback(
                 feature_name=f"--load_format {self.load_format}",
                 recommend_to_remove=False)
@@ -1205,7 +1261,9 @@ class EngineArgs:
                 and not envs.is_set("VLLM_ATTENTION_BACKEND")
             ) or envs.VLLM_ATTENTION_BACKEND == "FLASH_ATTN_VLLM_V1"
             supported = False
-            if fp8_attention and will_use_fa:
+            if current_platform.is_rocm():
+                supported = True
+            elif fp8_attention and will_use_fa:
                 from vllm.attention.utils.fa_utils import (
                     flash_attn_supports_fp8)
                 supported = flash_attn_supports_fp8()
@@ -1268,22 +1326,25 @@ class EngineArgs:
                                recommend_to_remove=False)
             return False
 
-        # Only Ngram speculative decoding so far.
+        # V1 supports N-gram, Medusa, and Eagle speculative decoding.
         is_ngram_enabled = False
         is_eagle_enabled = False
+        is_medusa_enabled = False
         if self.speculative_config is not None:
             # This is supported but experimental (handled below).
             speculative_method = self.speculative_config.get("method")
             if speculative_method:
                 if speculative_method in ("ngram", "[ngram]"):
                     is_ngram_enabled = True
-                elif speculative_method in ("eagle", "eagle3"):
+                elif speculative_method == "medusa":
+                    is_medusa_enabled = True
+                elif speculative_method in ("eagle", "eagle3", "deepseek_mtp"):
                     is_eagle_enabled = True
             else:
                 speculative_model = self.speculative_config.get("model")
                 if speculative_model in ("ngram", "[ngram]"):
                     is_ngram_enabled = True
-            if not (is_ngram_enabled or is_eagle_enabled):
+            if not (is_ngram_enabled or is_eagle_enabled or is_medusa_enabled):
                 # Other speculative decoding methods are not supported yet.
                 _raise_or_fallback(feature_name="Speculative Decoding",
                                    recommend_to_remove=False)
@@ -1323,18 +1384,11 @@ class EngineArgs:
             return False
 
         if (self.pipeline_parallel_size > 1
-                and self.distributed_executor_backend not in ["ray", "mp"]):
+                and self.distributed_executor_backend
+                not in ("ray", "mp", "external_launcher")):
             name = "Pipeline Parallelism without Ray distributed executor " \
-                    "or multiprocessing executor"
+                    "or multiprocessing executor or external launcher"
             _raise_or_fallback(feature_name=name, recommend_to_remove=False)
-            return False
-
-        # ngram is supported on V1, but off by default for now.
-        if is_ngram_enabled and _warn_or_fallback("ngram"):
-            return False
-
-        # Eagle is under development, so we don't support it yet.
-        if is_eagle_enabled and _warn_or_fallback("Eagle"):
             return False
 
         # Non-[CUDA, TPU] may be supported on V1, but off by default for now.
@@ -1438,11 +1492,15 @@ class EngineArgs:
         from vllm.platforms import current_platform
         try:
             device_memory = current_platform.get_device_total_memory()
+            device_name = current_platform.get_device_name().lower()
         except Exception:
             # This is only used to set default_max_num_batched_tokens
             device_memory = 0
 
-        if device_memory >= 70 * GiB_bytes:
+        # NOTE(Kuntai): Setting large `max_num_batched_tokens` for A100 reduces
+        # throughput, see PR #17885 for more details.
+        # So here we do an extra device name check to prevent such regression.
+        if device_memory >= 70 * GiB_bytes and "a100" not in device_name:
             # For GPUs like H100 and MI300x, use larger default values.
             default_max_num_batched_tokens = {
                 UsageContext.LLM_CLASS: 16384,

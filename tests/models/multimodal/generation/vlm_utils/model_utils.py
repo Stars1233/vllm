@@ -3,11 +3,11 @@
 for manipulating the input / output of HF & vLLM test runners, which are
 typically specific to a small subset of models.
 """
-import re
 import types
 from pathlib import PosixPath
 from typing import Optional, Union
 
+import regex as re
 import torch
 from PIL.Image import Image
 from transformers import (AutoConfig, AutoTokenizer, BatchFeature,
@@ -234,6 +234,18 @@ def minimax_vl_01_hf_output(hf_output: RunnerOutput,
     output_ids, output_str, out_logprobs = hf_output
     if output_str.endswith("<end_of_sentence>"):
         output_str = output_str.split("<end_of_sentence>")[0]
+    return output_ids, output_str, out_logprobs
+
+
+def ultravox_trunc_hf_output(hf_output: RunnerOutput,
+                             model: str) -> RunnerOutput:
+    output_ids, output_str, out_logprobs = hf_output
+
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    eos_token_id = tokenizer.eos_token_id
+    eos_token = tokenizer.decode(eos_token_id)
+    if output_str.endswith(eos_token):
+        output_str = output_str.split(eos_token)[0]
     return output_ids, output_str, out_logprobs
 
 
@@ -678,12 +690,8 @@ def molmo_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     return hf_model
 
 
-def ovis2_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
+def ovis_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     """Patches and returns an instance of the HfRunner to use for Ovis2."""
-    hf_model.model.visual_tokenizer.to(hf_model.dtype)
-    hf_model.model.vte.to(hf_model.dtype)
-    hf_model.model.llm.to(hf_model.dtype)
-
     hf_model.model.get_output_embeddings = lambda: \
         hf_model.model.llm.get_output_embeddings()
 
@@ -691,7 +699,16 @@ def ovis2_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
         text_tokenizer = hf_model.model.get_text_tokenizer()
         images = [images] if isinstance(images, Image) else images
 
-        text = text.split("<|im_start|>user\n")[1].split("<|im_end|>\n")[0]
+        prompt_start_and_end = {
+            "qwen2": ("<|im_start|>user\n", "<|im_end|>\n"),
+            "llama":
+            ("<|start_header_id|>user<|end_header_id|>\n\n", "<|eot_id|>"),
+            "gemma2": ("<start_of_turn>user\n", "<end_of_turn>\n"),
+        }
+        for start, end in prompt_start_and_end.values():
+            if start in text and end in text:
+                text = text.split(start)[1].split(end)[0]
+                break
 
         prompt, input_ids, pixel_values = hf_model.model.preprocess_inputs(
             text_or_conversations=text, images=images)
